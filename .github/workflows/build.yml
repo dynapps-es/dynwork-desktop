@@ -1,0 +1,426 @@
+name: build
+
+# Builds Dynwork from a commit of its private GitLab repository and publishes the installers in this repository's
+# releases. Only dispatched: the GitLab pipeline starts it after its checks pass (main → canary, `X.Y.Z` tag → stable,
+# `X.Y.Z-beta.N` tag → beta), and a person can start a `test` build by hand, which publishes nothing.
+#
+# The workspace of every job is the fetched code, not this repository: `git init`, fetch `sha` from GitLab with the
+# deploy token of the `release` environment, check `HEAD == sha`. `./.github/actions/setup-bun` and `dynwork/script/*`
+# are the code's own. The token never goes in a URL or in `.git/config`: it is sent as a masked Basic header on the
+# fetch alone, and only that step sees it.
+#
+# Signing is off while the repository variables `MAC_SIGNING` and `WINDOWS_SIGNING` are not `true`: the unsigned pack
+# runs, and no signing secret reaches any step. The publish job holds the only write token and runs no code from GitLab.
+run-name: "${{ inputs.kind }} ${{ inputs.ref }} ${{ inputs.sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: canary, beta or stable publish; test builds and publishes nothing
+        type: choice
+        options: [canary, beta, stable, test]
+        required: true
+      ref:
+        description: Branch or tag in GitLab the commit belongs to (the tag itself for beta and stable)
+        type: string
+        required: true
+      sha:
+        description: Full SHA of the commit to build
+        type: string
+        required: true
+      targets:
+        description: JSON list of mac-arm64, mac-x64, windows-x64, linux-x64 (empty is ["mac-arm64"] for canary, all four otherwise)
+        type: string
+        default: ""
+      version:
+        description: The tag of a beta (X.Y.Z-beta.N) or stable (X.Y.Z); empty for canary and test
+        type: string
+        default: ""
+
+# A newer canary replaces the running one, and a newer test build of a ref replaces that ref's; betas and stables run
+# alone and are never cancelled.
+concurrency:
+  group: >-
+    ${{ inputs.kind == 'canary' && 'build-canary' ||
+    inputs.kind == 'test' && format('build-test-{0}', inputs.ref) ||
+    format('build-{0}-{1}', inputs.kind, github.run_id) }}
+  cancel-in-progress: ${{ inputs.kind == 'canary' || inputs.kind == 'test' }}
+
+permissions:
+  contents: read
+
+env:
+  BUN_CONFIG_REGISTRY: https://registry.npmjs.org/
+  SOURCE: https://gitlab.dynapps.be/ai/dynwork-desktop.git
+  # Release notes name the commit as text: the GitLab project is private.
+  SOURCE_NAME: gitlab.dynapps.be/ai/dynwork-desktop
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: check the commit, pick the version and the targets
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    outputs:
+      include: ${{ steps.inputs.outputs.include }}
+      channel: ${{ steps.version.outputs.channel }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check the inputs and pick the runners
+        id: inputs
+        env:
+          KIND: ${{ inputs.kind }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ inputs.sha }}
+          TARGETS: ${{ inputs.targets }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "sha must be a full commit SHA (40 lowercase hex), not \"$SHA\""
+          if [[ "$REF" == -* ]] || ! git check-ref-format "refs/x/$REF"; then
+            fail "ref must be a branch or tag name, not \"$REF\""
+          fi
+          case "$KIND" in
+            canary | test)
+              [ -z "$VERSION" ] || fail "a $KIND build takes no version: it is decided from the run number"
+              ;;
+            beta)
+              [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$ ]] || fail "a beta's version is X.Y.Z-beta.N, not \"$VERSION\""
+              [ "$REF" = "$VERSION" ] || fail "a beta is built from its tag: ref must be \"$VERSION\""
+              ;;
+            stable)
+              [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "a stable's version is X.Y.Z, not \"$VERSION\""
+              [ "$REF" = "$VERSION" ] || fail "a stable is built from its tag: ref must be \"$VERSION\""
+              ;;
+          esac
+          all='[
+            {"target":"mac-arm64","host":"macos-26"},
+            {"target":"mac-x64","host":"macos-26-intel"},
+            {"target":"windows-x64","host":"windows-2025"},
+            {"target":"linux-x64","host":"ubuntu-24.04"}
+          ]'
+          if [ -z "$TARGETS" ]; then
+            if [ "$KIND" = canary ]; then TARGETS='["mac-arm64"]'; else TARGETS=$(jq -c 'map(.target)' <<<"$all"); fi
+          fi
+          jq -e 'type == "array" and all(type == "string")' <<<"$TARGETS" > /dev/null 2>&1 ||
+            fail "targets must be a JSON list of strings, not $TARGETS"
+          include=$(jq -c --argjson targets "$TARGETS" '[.[] | select(.target as $t | $targets | index($t))]' <<<"$all")
+          want=$(jq 'unique | length' <<<"$TARGETS")
+          if [ "$(jq length <<<"$include")" -ne "$want" ] || [ "$want" -eq 0 ]; then
+            fail "targets must be a non-empty list of mac-arm64, mac-x64, windows-x64 or linux-x64, not $TARGETS"
+          fi
+          # The latest release's download links and the Windows feed must all be there.
+          if [ "$KIND" = stable ] && [ "$want" -ne 4 ]; then fail "a stable builds all four targets"; fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+      # Defined once here and repeated by alias in the other jobs that need the code.
+      - &fetch
+        name: Fetch the commit from GitLab
+        env:
+          GITLAB_DEPLOY_USER: ${{ secrets.GITLAB_DEPLOY_USER }}
+          GITLAB_DEPLOY_TOKEN: ${{ secrets.GITLAB_DEPLOY_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+          KIND: ${{ inputs.kind }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [ -z "$GITLAB_DEPLOY_USER" ] || [ -z "$GITLAB_DEPLOY_TOKEN" ]; then
+            echo "::error::the release environment lacks the GITLAB_DEPLOY_USER and GITLAB_DEPLOY_TOKEN secrets"
+            exit 1
+          fi
+          auth=$(printf '%s:%s' "$GITLAB_DEPLOY_USER" "$GITLAB_DEPLOY_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          # GitLab serves any commit by its SHA, so the build is the commit asked for even if the ref moved since. A beta
+          # or stable also fetches its tag, which must still point at that commit.
+          refs=("$SHA")
+          case "$KIND" in beta | stable) refs+=("+refs/tags/$REF:refs/tags/$REF") ;; esac
+          git init --quiet .
+          git -c credential.helper= -c "http.extraHeader=Authorization: Basic $auth" \
+            fetch --quiet --no-tags --depth=1 "$SOURCE" "${refs[@]}"
+          git checkout --quiet --detach "$SHA"
+          if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+            echo "::error::HEAD is $(git rev-parse HEAD), not $SHA"
+            exit 1
+          fi
+          case "$KIND" in
+            beta | stable)
+              if [ "$(git rev-parse "refs/tags/$REF^{commit}")" != "$SHA" ]; then
+                echo "::error::the tag $REF in GitLab is not $SHA"
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Set up Bun
+        if: inputs.kind == 'canary' || inputs.kind == 'test'
+        uses: ./.github/actions/setup-bun
+
+      - name: Pick the version, the channel and the notes
+        id: version
+        env:
+          KIND: ${{ inputs.kind }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+          # The canaries of dynapps-es/dynwork reached 0.5.1-canary.85; this repository's run numbers restart at 1.
+          CANARY_RUN_OFFSET: ${{ vars.CANARY_RUN_OFFSET }}
+        run: |
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          identity=$(sed -n 's/^export const version = "\([^"]*\)"$/\1/p' dynwork/packages/branding/src/identity.ts)
+          [ -n "$identity" ] || fail "no version in dynwork/packages/branding/src/identity.ts"
+          source="Built from $SOURCE_NAME@$SHA ($REF)."
+          notes="$RUNNER_TEMP/notes/notes.md"
+          mkdir -p "$(dirname "$notes")"
+          case "$KIND" in
+            canary | test)
+              [[ "$CANARY_RUN_OFFSET" =~ ^[0-9]+$ ]] || fail "the repository variable CANARY_RUN_OFFSET must be a whole number"
+              version=$(bun dynwork/script/canary.ts version "$((RUN_NUMBER + CANARY_RUN_OFFSET))")
+              channel=canary
+              printf 'Canary %s\n\n%s\n' "$version" "$source" > "$notes"
+              ;;
+            beta)
+              [ "${VERSION%-beta.*}" = "$identity" ] || fail "$VERSION is not a beta of $identity, the version in identity.ts"
+              version=$VERSION
+              channel=internal
+              { printf 'Beta %s\n\n%s\n\n' "$version" "$source"; cat dynwork/releases/install.md; } > "$notes"
+              ;;
+            stable)
+              [ "$VERSION" = "$identity" ] || fail "$VERSION does not match $identity, the version in identity.ts"
+              test -s "dynwork/releases/$VERSION.md" || fail "dynwork/releases/$VERSION.md is missing"
+              version=$VERSION
+              channel=internal
+              {
+                cat "dynwork/releases/$VERSION.md"
+                echo
+                cat dynwork/releases/install.md
+                printf '\n%s\n' "$source"
+              } > "$notes"
+              ;;
+          esac
+          {
+            echo "version=$version"
+            echo "channel=$channel"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s %s, channel %s, from %s@%s\n' "$KIND" "$version" "$channel" "$REF" "$SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the notes for publishing
+        if: inputs.kind != 'test'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: notes
+          path: ${{ runner.temp }}/notes/notes.md
+          if-no-files-found: error
+          retention-days: 3
+
+  package:
+    name: package ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.include) }}
+    runs-on: ${{ matrix.host }}
+    environment: release
+    timeout-minutes: 60
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      DYNWORK_CHANNEL: ${{ needs.prepare.outputs.channel }}
+      DYNWORK_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - *fetch
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Package, unsigned
+        if: >-
+          !(runner.os == 'macOS' && vars.MAC_SIGNING == 'true') &&
+          !(runner.os == 'Windows' && vars.WINDOWS_SIGNING == 'true')
+        run: bun dynwork/script/package.ts
+
+      # electron-builder imports CSC_LINK into a keychain and notarizes whenever APPLE_API_* are set, so these secrets
+      # exist only in this step. APPLE_API_KEY is the path of the .p8, written from its base64 secret.
+      - name: Package, signed and notarized
+        if: runner.os == 'macOS' && vars.MAC_SIGNING == 'true'
+        env:
+          DYNWORK_MAC_SIGNING: "1"
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          key="$RUNNER_TEMP/apple-api-key.p8"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$key")
+          unset APPLE_API_KEY_P8
+          APPLE_API_KEY="$key" bun dynwork/script/package.ts
+
+      - name: Package, signed
+        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING == 'true'
+        env:
+          DYNWORK_WINDOWS_SIGNING: "1"
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PUBLISHER: ${{ secrets.AZURE_SIGNING_PUBLISHER }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: bun dynwork/script/package.ts
+
+      # dist/dynwork holds only the installers and the latest*.yml feeds package.ts checked.
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dynwork-${{ inputs.kind }}-${{ matrix.target }}
+          path: dist/dynwork
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: publish
+    # Only when every target built: a release missing a platform that was asked for is not published.
+    needs: [prepare, package]
+    if: inputs.kind != 'test'
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      KIND: ${{ inputs.kind }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download the installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dynwork-${{ inputs.kind }}-*
+          path: artifacts
+
+      - name: Download the notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notes
+          path: .
+
+      # Each signed macOS pack writes its own latest-mac.yml: one feed lists both architectures. Unsigned macOS packs
+      # write none.
+      - name: Gather the files
+        run: |
+          shopt -s nullglob
+          mkdir dist
+          mac=()
+          for file in artifacts/*/*; do
+            name=$(basename "$file")
+            if [ "$name" = latest-mac.yml ]; then
+              mac+=("$file")
+            elif [ -e "dist/$name" ]; then
+              echo "::error::two targets produced $name"
+              exit 1
+            else
+              cp "$file" dist/
+            fi
+          done
+          if [ "${#mac[@]}" -gt 0 ]; then
+            # shellcheck disable=SC2016 # $item is yq's, not the shell's
+            yq eval-all '. as $item ireduce ({}; . *+ $item)' "${mac[@]}" > dist/latest-mac.yml
+          fi
+          ls -l dist
+
+      # The installers first and the latest*.yml feeds last: an updater reads a rolling release as soon as it changes,
+      # and must not find a feed whose installer is not there yet. A new release is created as a draft, filled and then
+      # published by `gh release create`, so it shows complete.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          installers=()
+          feeds=()
+          for file in dist/*; do
+            case "$(basename "$file")" in
+              latest*.yml) feeds+=("$file") ;;
+              *) installers+=("$file") ;;
+            esac
+          done
+          if [ "${#installers[@]}" -eq 0 ]; then
+            echo "::error::the artifacts hold no installer to publish"
+            exit 1
+          fi
+          # The tags of this repository point at its own commits; the notes name the commit built.
+          rolling() {
+            if ! gh release view "$1" > /dev/null 2>&1; then
+              gh release create "$1" --target "$GITHUB_SHA" --prerelease --latest=false --title "$2" --notes-file notes.md
+            fi
+            gh release edit "$1" --prerelease --latest=false --title "$2" --notes-file notes.md
+            gh release upload "$1" "${installers[@]}" --clobber
+            if [ "${#feeds[@]}" -gt 0 ]; then gh release upload "$1" "${feeds[@]}" --clobber; fi
+          }
+          case "$KIND" in
+            canary)
+              rolling dynwork-canary "Dynwork Canary"
+              ;;
+            beta)
+              gh release create "$VERSION" "${installers[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
+                --prerelease --latest=false --title "Dynwork $VERSION" --notes-file notes.md
+              rolling dynwork-beta "Dynwork Beta"
+              ;;
+            stable)
+              gh release create "$VERSION" "${installers[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
+                --latest --title "Dynwork $VERSION" --notes-file notes.md
+              ;;
+          esac
+
+  guard:
+    name: check that no prerelease is the latest
+    # Windows installs of the internal channel follow releases/latest: a canary or beta there would reach them.
+    needs: publish
+    if: inputs.kind == 'canary' || inputs.kind == 'beta'
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    steps:
+      - *fetch
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Check the releases against releases/latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KIND: ${{ inputs.kind }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$KIND" in
+            canary) tags=(dynwork-canary) ;;
+            beta) tags=("$VERSION" dynwork-beta) ;;
+          esac
+          # Until this repository has a stable release, releases/latest answers 404, and only that passes as no latest.
+          status=$( (gh api -i "repos/$GH_REPO/releases/latest" 2> /dev/null || true) | head -n 1 | cut -d ' ' -f 2)
+          case "$status" in
+            200) latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name) ;;
+            404) latest=--no-latest ;;
+            *)
+              echo "::error::releases/latest answered \"$status\""
+              exit 1
+              ;;
+          esac
+          for tag in "${tags[@]}"; do
+            echo "Checking $tag against the latest release ($latest)"
+            prerelease=$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)
+            bun dynwork/script/canary.ts guard "$prerelease" "$latest"
+          done
