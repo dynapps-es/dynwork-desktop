@@ -9,8 +9,10 @@ name: build
 # are the code's own. The token never goes in a URL or in `.git/config`: it is sent as a masked Basic header on the
 # fetch alone, and only that step sees it.
 #
-# Signing is off while the repository variables `MAC_SIGNING` and `WINDOWS_SIGNING` are not `true`: the unsigned pack
-# runs, and no signing secret reaches any step. The publish job holds the only write token and runs no code from GitLab.
+# Signing by Apple and Microsoft is off while the repository variables `MAC_SIGNING` and `WINDOWS_SIGNING` are not
+# `true`: no Developer ID or Artifact Signing secret reaches any step. Until then macOS packs are signed with DynWork's
+# self-signed certificate, whose `.p12` only the macOS packing step sees, so each Mac build updates to the next. The
+# publish job holds the only write token and runs no code from GitLab.
 run-name: "${{ inputs.kind }} ${{ inputs.ref }} ${{ inputs.sha }}"
 
 on:
@@ -249,10 +251,44 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
 
       - name: Package, unsigned
-        if: >-
-          !(runner.os == 'macOS' && vars.MAC_SIGNING == 'true') &&
-          !(runner.os == 'Windows' && vars.WINDOWS_SIGNING == 'true')
+        if: runner.os == 'Linux' || (runner.os == 'Windows' && vars.WINDOWS_SIGNING != 'true')
         run: bun dynwork/script/package.ts
+
+      # Squirrel.Mac only installs an update that satisfies the running app's designated requirement, which an ad hoc
+      # signature ties to one build: until the Developer ID, every Mac build is signed with the same self-signed
+      # certificate. Its .p12 and password exist only in this step, the .p12 is imported into a keychain made for this
+      # run and deleted with it, and package.ts signs from that keychain (DYNWORK_MAC_KEYCHAIN).
+      - name: Package, self-signed
+        if: runner.os == 'macOS' && vars.MAC_SIGNING != 'true'
+        env:
+          MAC_SELF_SIGNED_P12: ${{ secrets.MAC_SELF_SIGNED_P12 }}
+          MAC_SELF_SIGNED_PASSWORD: ${{ secrets.MAC_SELF_SIGNED_PASSWORD }}
+        run: |
+          # A commit from before the self-signed mode packs ad hoc, as it always has.
+          if ! grep -q DYNWORK_MAC_KEYCHAIN dynwork/packages/build/src/signing.ts; then
+            unset MAC_SELF_SIGNED_P12 MAC_SELF_SIGNED_PASSWORD
+            bun dynwork/script/package.ts
+            exit
+          fi
+          if [ -z "$MAC_SELF_SIGNED_P12" ] || [ -z "$MAC_SELF_SIGNED_PASSWORD" ]; then
+            echo "::error::the release environment lacks the MAC_SELF_SIGNED_P12 and MAC_SELF_SIGNED_PASSWORD secrets"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/dynwork-self-signed.keychain-db"
+          p12="$RUNNER_TEMP/dynwork-self-signed.p12"
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          trap 'security delete-keychain "$keychain" 2> /dev/null || true; rm -f "$p12"' EXIT
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          (umask 077 && printf '%s' "$MAC_SELF_SIGNED_P12" | base64 --decode > "$p12")
+          security import "$p12" -k "$keychain" -P "$MAC_SELF_SIGNED_PASSWORD" -T /usr/bin/codesign > /dev/null
+          rm -f "$p12"
+          # codesign may use the key without a prompt; the listing it prints is of no use here.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          unset MAC_SELF_SIGNED_P12 MAC_SELF_SIGNED_PASSWORD
+          DYNWORK_MAC_KEYCHAIN="$keychain" bun dynwork/script/package.ts
 
       # electron-builder imports CSC_LINK into a keychain and notarizes whenever APPLE_API_* are set, so these secrets
       # exist only in this step. APPLE_API_KEY is the path of the .p8, written from its base64 secret.
@@ -321,8 +357,8 @@ jobs:
           name: notes
           path: .
 
-      # Each signed macOS pack writes its own latest-mac.yml: one feed lists both architectures. Unsigned macOS packs
-      # write none.
+      # Each self-signed or signed macOS pack writes its own latest-mac.yml: one feed lists both architectures, whose
+      # zips electron-updater tells apart by name. Packs signed ad hoc write none.
       - name: Gather the files
         run: |
           shopt -s nullglob
