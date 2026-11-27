@@ -30,7 +30,7 @@ on:
         type: string
         required: true
       targets:
-        description: JSON list of mac-arm64, mac-x64, windows-x64, linux-x64 (empty is ["mac-arm64"] for canary, all four otherwise)
+        description: JSON list of mac-arm64, mac-x64, windows-x64, linux-x64, linux-arm64 (empty is all five)
         type: string
         default: ""
       version:
@@ -105,20 +105,19 @@ jobs:
             {"target":"mac-arm64","host":"macos-26"},
             {"target":"mac-x64","host":"macos-26-intel"},
             {"target":"windows-x64","host":"windows-2025"},
-            {"target":"linux-x64","host":"ubuntu-24.04"}
+            {"target":"linux-x64","host":"ubuntu-24.04"},
+            {"target":"linux-arm64","host":"ubuntu-24.04-arm"}
           ]'
-          if [ -z "$TARGETS" ]; then
-            if [ "$KIND" = canary ]; then TARGETS='["mac-arm64"]'; else TARGETS=$(jq -c 'map(.target)' <<<"$all"); fi
-          fi
+          if [ -z "$TARGETS" ]; then TARGETS=$(jq -c 'map(.target)' <<<"$all"); fi
           jq -e 'type == "array" and all(type == "string")' <<<"$TARGETS" > /dev/null 2>&1 ||
             fail "targets must be a JSON list of strings, not $TARGETS"
           include=$(jq -c --argjson targets "$TARGETS" '[.[] | select(.target as $t | $targets | index($t))]' <<<"$all")
           want=$(jq 'unique | length' <<<"$TARGETS")
           if [ "$(jq length <<<"$include")" -ne "$want" ] || [ "$want" -eq 0 ]; then
-            fail "targets must be a non-empty list of mac-arm64, mac-x64, windows-x64 or linux-x64, not $TARGETS"
+            fail "targets must be a non-empty list of mac-arm64, mac-x64, windows-x64, linux-x64 or linux-arm64, not $TARGETS"
           fi
-          # The latest release's download links and the Windows feed must all be there.
-          if [ "$KIND" = stable ] && [ "$want" -ne 4 ]; then fail "a stable builds all four targets"; fi
+          # The latest release's download links and every feed file must all be there.
+          if [ "$KIND" = stable ] && [ "$want" -ne 5 ]; then fail "a stable builds all five targets"; fi
           echo "include=$include" >> "$GITHUB_OUTPUT"
 
       # Defined once here and repeated by alias in the other jobs that need the code.
@@ -244,6 +243,11 @@ jobs:
       - name: Set up Bun
         uses: ./.github/actions/setup-bun
 
+      # electron-builder makes the rpm with rpmbuild, which the Ubuntu images lack.
+      - name: Set up rpm
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
+
       - name: Package, unsigned
         if: >-
           !(runner.os == 'macOS' && vars.MAC_SIGNING == 'true') &&
@@ -343,7 +347,9 @@ jobs:
 
       # The installers first and the latest*.yml feeds last: an updater reads a rolling release as soon as it changes,
       # and must not find a feed whose installer is not there yet. A new release is created as a draft, filled and then
-      # published by `gh release create`, so it shows complete.
+      # published by `gh release create`, so it shows complete. Betas read the rolling dynwork-beta (the beta feed of
+      # dynwork/packages/branding/src/identity.ts): every beta and every stable goes there, so beta installs move to
+      # the newest of either.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -381,6 +387,7 @@ jobs:
             stable)
               gh release create "$VERSION" "${installers[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
                 --latest --title "Dynwork $VERSION" --notes-file notes.md
+              rolling dynwork-beta "Dynwork Beta"
               ;;
           esac
 

@@ -10,13 +10,17 @@ workflows that fetch that code, compile it for each channel and publish the resu
 
 Dynwork, the stable release. These links always serve the latest one:
 
-| System                     | Download                                                                                                                                   |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| macOS, Apple Silicon (M1+) | [dynwork-desktop-mac-arm64.dmg](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-mac-arm64.dmg)         |
-| macOS, Intel               | [dynwork-desktop-mac-x64.dmg](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-mac-x64.dmg)             |
-| Windows 10 and 11, x64     | [dynwork-desktop-win-x64.exe](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-win-x64.exe)             |
-| Debian and Ubuntu, x64     | [dynwork-desktop-linux-amd64.deb](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-amd64.deb)     |
+| System                     | Download                                                                                                                                              |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS, Apple Silicon (M1+) | [dynwork-desktop-mac-arm64.dmg](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-mac-arm64.dmg)                 |
+| macOS, Intel               | [dynwork-desktop-mac-x64.dmg](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-mac-x64.dmg)                     |
+| Windows 10 and 11, x64     | [dynwork-desktop-win-x64.exe](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-win-x64.exe)                     |
+| Debian and Ubuntu, x64     | [dynwork-desktop-linux-amd64.deb](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-amd64.deb)             |
+| Fedora and openSUSE, x64   | [dynwork-desktop-linux-x86_64.rpm](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-x86_64.rpm)           |
 | Other Linux, x64           | [dynwork-desktop-linux-x86_64.AppImage](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-x86_64.AppImage) |
+| Debian and Ubuntu, ARM64   | [dynwork-desktop-linux-arm64.deb](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-arm64.deb)             |
+| Fedora and openSUSE, ARM64 | [dynwork-desktop-linux-aarch64.rpm](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-aarch64.rpm)         |
+| Other Linux, ARM64         | [dynwork-desktop-linux-arm64.AppImage](https://github.com/dynapps-es/dynwork-desktop/releases/latest/download/dynwork-desktop-linux-arm64.AppImage)   |
 
 The first stable release published here is the one after `0.6.0`; until it exists these links answer 404, and
 `0.6.0` and earlier are in [dynapps-es/dynwork](https://github.com/dynapps-es/dynwork/releases/latest). Each release's
@@ -29,11 +33,15 @@ Versions have no `v` prefix: `0.6.0` is a stable release, `0.6.0-beta.1` a beta.
 For the team that develops Dynwork, not for work:
 
 - **Canary** (`dynwork-canary`, a prerelease replaced on every merge to `main`): Dynwork Canary, which installs beside
-  Dynwork with its own accounts and data. macOS Apple Silicon:
+  Dynwork with its own accounts and data, built for every platform, for example macOS Apple Silicon:
   [dynwork-canary-desktop-mac-arm64.dmg](https://github.com/dynapps-es/dynwork-desktop/releases/download/dynwork-canary/dynwork-canary-desktop-mac-arm64.dmg).
-  Other platforms are there only when a canary was built for them.
-- **Beta** (`X.Y.Z-beta.N`, plus the prerelease `dynwork-beta` that always holds the newest one): the stable app at a
-  beta version, with the same file names as the stable release.
+- **Beta** (`X.Y.Z-beta.N`, plus the prerelease `dynwork-beta` that always holds the newest beta or stable): the stable
+  app at a beta version, with the same file names as the stable release. Beta installs update from `dynwork-beta`, so
+  they receive the next beta and the next stable, and never an older version.
+
+Each channel's release carries the files its updater reads: `latest.yml` (Windows), `latest-linux.yml` (Linux x64) and
+`latest-linux-arm64.yml` (Linux ARM64). Windows and the Linux AppImage update themselves; macOS does not yet, since the
+builds are not signed.
 
 Prereleases are never the latest release: the last job of every canary and beta build fails if one is.
 
@@ -41,11 +49,11 @@ Prereleases are never the latest release: the last job of every canary and beta 
 
 The GitLab pipeline dispatches `.github/workflows/build.yml` once its checks pass:
 
-| Ref in GitLab                   | `kind`   | Publishes                                                               |
-| ------------------------------- | -------- | ----------------------------------------------------------------------- |
-| `main`                          | `canary` | the `dynwork-canary` prerelease, macOS Apple Silicon only               |
-| a tag `X.Y.Z-beta.N`            | `beta`   | the prerelease `X.Y.Z-beta.N` and `dynwork-beta`, all four targets      |
-| a tag `X.Y.Z`                   | `stable` | the release `X.Y.Z`, marked latest, all four targets                    |
+| Ref in GitLab        | `kind`   | Publishes                                                                 |
+| -------------------- | -------- | ------------------------------------------------------------------------- |
+| `main`               | `canary` | the `dynwork-canary` prerelease, all five targets                         |
+| a tag `X.Y.Z-beta.N` | `beta`   | the prerelease `X.Y.Z-beta.N` and `dynwork-beta`, all five targets        |
+| a tag `X.Y.Z`        | `stable` | the release `X.Y.Z`, marked latest, then `dynwork-beta`, all five targets |
 
 A build can also be started by hand from `main`, for example to try a branch on every platform without publishing it
 (`kind=test` uploads the installers as workflow artifacts kept 3 days, and publishes nothing):
@@ -57,8 +65,7 @@ gh workflow run build.yml -R dynapps-es/dynwork-desktop \
 
 The inputs are `kind` (`canary`, `beta`, `stable` or `test`), `ref` (the GitLab branch or tag; for a beta or stable the
 tag itself), `sha` (the full commit, which must be in GitLab), `targets` (a JSON list of `mac-arm64`, `mac-x64`,
-`windows-x64` and `linux-x64`; empty is `["mac-arm64"]` for a canary and all four otherwise, and a stable always builds
-all four) and `version` (the tag of a beta or stable; empty for canary and test). Each run is named
+`windows-x64`, `linux-x64` and `linux-arm64`; empty is all five, and a stable always builds all five) and `version` (the tag of a beta or stable; empty for canary and test). Each run is named
 `<kind> <ref> <sha>`.
 
 What a build checks before packing:
