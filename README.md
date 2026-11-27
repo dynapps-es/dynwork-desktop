@@ -60,11 +60,11 @@ Prereleases are never the latest release: the last job of every canary and beta 
 
 The GitLab pipeline dispatches `.github/workflows/build.yml` once its checks pass:
 
-| Ref in GitLab        | `kind`   | Publishes                                                                 |
-| -------------------- | -------- | ------------------------------------------------------------------------- |
-| `main`               | `canary` | the `dynwork-canary` prerelease, all five targets                         |
-| a tag `X.Y.Z-beta.N` | `beta`   | the prerelease `X.Y.Z-beta.N` and `dynwork-beta`, all five targets        |
-| a tag `X.Y.Z`        | `stable` | the release `X.Y.Z`, marked latest, then `dynwork-beta`, all five targets |
+| Ref in GitLab        | `kind`                       | Publishes                                                                 |
+| -------------------- | ---------------------------- | ------------------------------------------------------------------------- |
+| `main`               | `update-test`, then `canary` | nothing, then the `dynwork-canary` prerelease, all five targets           |
+| a tag `X.Y.Z-beta.N` | `beta`                       | the prerelease `X.Y.Z-beta.N` and `dynwork-beta`, all five targets        |
+| a tag `X.Y.Z`        | `stable`                     | the release `X.Y.Z`, marked latest, then `dynwork-beta`, all five targets |
 
 A build can also be started by hand from `main`, for example to try a branch on every platform without publishing it
 (`kind=test` uploads the installers as workflow artifacts kept 3 days, and publishes nothing):
@@ -74,9 +74,30 @@ gh workflow run build.yml -R dynapps-es/dynwork-desktop \
   -f kind=test -f ref=<branch> -f sha=<full commit sha> -f targets='["mac-arm64","windows-x64","linux-x64"]'
 ```
 
-The inputs are `kind` (`canary`, `beta`, `stable` or `test`), `ref` (the GitLab branch or tag; for a beta or stable the
+### The update test
+
+An `update-test` build proves that the commit's packed app updates itself: on `mac-arm64` (signed with the self-signed
+certificate, so Squirrel.Mac checks the update as on a person's Mac), `windows-x64` (the per-user NSIS install) and
+`linux-x64` (the AppImage, then the deb through its updater with the runner's passwordless sudo) it runs the code's
+`dynwork/script/update-test.ts`: two packs of the commit at two versions with the update test's hook compiled in, the
+newer one served on a local feed, the older one installed and started; it must end up installed and running as the newer
+one. Its jobs are named `update-test <target>` and it publishes nothing.
+
+The canary is gated on it: the `gate` job publishes the canary of a commit that has `dynwork/script/update-test.ts` only
+when an `update-test` build of that same commit, dispatched from this repository's `main`, passed on all three targets
+(GitLab's main pipeline runs it first). Commits from before the update test publish ungated; betas and stables are not
+gated. To run it for a merge request's head before merging:
+
+```bash
+gh workflow run build.yml -R dynapps-es/dynwork-desktop -f kind=update-test -f ref=<branch> -f sha=<full commit sha>
+```
+
+Not covered: Windows Smart App Control on an unsigned update, and the deb/rpm admin prompt (pkexec), which a CI machine
+cannot answer; nor the rpm or the ARM64 and Intel Mac builds.
+
+The inputs are `kind` (`canary`, `beta`, `stable`, `test` or `update-test`), `ref` (the GitLab branch or tag; for a beta or stable the
 tag itself), `sha` (the full commit, which must be in GitLab), `targets` (a JSON list of `mac-arm64`, `mac-x64`,
-`windows-x64`, `linux-x64` and `linux-arm64`; empty is all five, and a stable always builds all five) and `version` (the tag of a beta or stable; empty for canary and test). Each run is named
+`windows-x64`, `linux-x64` and `linux-arm64`; empty is all five, and a stable always builds all five) and `version` (the tag of a beta or stable; empty for canary, test and update-test, which takes no targets either). Each run is named
 `<kind> <ref> <sha>`.
 
 What a build checks before packing:
