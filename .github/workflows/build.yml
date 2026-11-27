@@ -377,6 +377,16 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: bun "$PACK"
 
+      # A failed update test leaves the app's logs, the hook's file and, on macOS, a picture of the screen.
+      - name: Upload what the update test saw
+        if: failure() && inputs.kind == 'update-test'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: update-test-${{ matrix.target }}
+          path: dist/update-test/diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
       # dist/dynwork holds only the installers and the latest*.yml feeds package.ts checked.
       - name: Upload
         if: inputs.kind != 'update-test'
