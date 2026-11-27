@@ -24,7 +24,8 @@ Dynwork, the stable release. These links always serve the latest one:
 
 The first stable release published here is the one after `0.6.0`; until it exists these links answer 404, and
 `0.6.0` and earlier are in [dynapps-es/dynwork](https://github.com/dynapps-es/dynwork/releases/latest). Each release's
-notes say how to open the app past the system's warning: the builds are not signed by Apple or Microsoft yet.
+notes say how to open the app past the system's warning: the builds are not signed by Apple or Microsoft yet (macOS
+builds are self-signed, see "macOS signing").
 
 Versions have no `v` prefix: `0.6.0` is a stable release, `0.6.0-beta.1` a beta.
 
@@ -39,9 +40,19 @@ For the team that develops Dynwork, not for work:
   app at a beta version, with the same file names as the stable release. Beta installs update from `dynwork-beta`, so
   they receive the next beta and the next stable, and never an older version.
 
-Each channel's release carries the files its updater reads: `latest.yml` (Windows), `latest-linux.yml` (Linux x64) and
-`latest-linux-arm64.yml` (Linux ARM64). Windows and the Linux AppImage update themselves; macOS does not yet, since the
-builds are not signed.
+Each channel's release carries the files its updater reads: `latest.yml` (Windows), `latest-linux.yml` (Linux x64),
+`latest-linux-arm64.yml` (Linux ARM64) and `latest-mac.yml` (macOS, both architectures, with a zip per architecture).
+Windows and the Linux AppImage update themselves.
+
+### macOS signing
+
+Until Dynwork has an Apple Developer ID, the macOS builds are signed with one self-signed certificate,
+`DynWork Desktop (self-signed)` (SHA-1 `6C72770FE3DD0DB2C8608EA0E2513E13984A6507`). macOS updates an app only with a
+build that satisfies the installed one's designated requirement: ad hoc builds (`0.7.0` and the canaries before the
+first self-signed one) can never accept the next build, self-signed ones always can. So an ad hoc install is
+reinstalled by hand once, from the release page, and updates itself from then on. The requirement also accepts a
+Developer ID of the Dynapps team (INDAWS, `9U2YABY5RU`), so the switch to the Developer ID needs no second reinstall.
+The first download still opens past Gatekeeper's warning, since the builds are not notarized.
 
 Prereleases are never the latest release: the last job of every canary and beta build fails if one is.
 
@@ -78,9 +89,15 @@ What a build checks before packing:
 ## Settings this repository relies on
 
 - Environment `release`, deployable from `main` only. Every job runs in it. It holds the GitLab deploy token
-  (`GITLAB_DEPLOY_USER`, `GITLAB_DEPLOY_TOKEN`, read-only on the code) and, once signing exists, the signing secrets.
+  (`GITLAB_DEPLOY_USER`, `GITLAB_DEPLOY_TOKEN`, read-only on the code), the self-signed macOS certificate
+  (`MAC_SELF_SIGNED_P12`, the `.p12` in base64, and `MAC_SELF_SIGNED_PASSWORD`) and, once signing exists, the signing
+  secrets.
 - Repository variables: `CANARY_RUN_OFFSET` (`1000`: run numbers restarted here, and canary versions must keep
   climbing past `0.5.1-canary.85`), `MAC_SIGNING` and `WINDOWS_SIGNING` (`false`).
+- With `MAC_SIGNING` not `true`, the macOS packing step imports the self-signed `.p12` into a keychain made for the
+  run, signs from it (`DYNWORK_MAC_KEYCHAIN`) and deletes it; a commit from before that mode packs ad hoc. The
+  certificate is never replaced: a new one would make every Mac reinstall by hand. Its backup is in the GitLab
+  project's CI/CD variables (`MAC_SELF_SIGNED_P12_BACKUP`, `MAC_SELF_SIGNED_PASSWORD_BACKUP`, masked and hidden).
 - With `MAC_SIGNING=true` the macOS packs are signed with the Developer ID and notarized; they need the `release`
   secrets `CSC_LINK` (the `.p12`, base64), `CSC_KEY_PASSWORD`, `APPLE_API_KEY_P8` (the App Store Connect `.p8`,
   base64), `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`. With `WINDOWS_SIGNING=true` the Windows pack is signed with
