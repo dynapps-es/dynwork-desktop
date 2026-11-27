@@ -287,6 +287,13 @@ jobs:
           rm -f "$p12"
           # codesign may use the key without a prompt; the listing it prints is of no use here.
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          # On the runner codesign finds identities only in the keychains of the search list, whatever its --keychain
+          # says, as electron-builder's own keychain handling notes; deleting the keychain takes it off the list.
+          # shellcheck disable=SC2046 # one path per line, none with spaces
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # The certificate's name and public hash, untrusted as a self-signed certificate is.
+          security find-identity -p codesigning "$keychain" | grep 'DynWork Desktop (self-signed)' ||
+            { echo "::error::the keychain holds no DynWork Desktop (self-signed) identity"; exit 1; }
           unset MAC_SELF_SIGNED_P12 MAC_SELF_SIGNED_PASSWORD
           DYNWORK_MAC_KEYCHAIN="$keychain" bun dynwork/script/package.ts
 
