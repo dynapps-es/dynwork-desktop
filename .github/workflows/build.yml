@@ -4,6 +4,11 @@ name: build
 # releases. Only dispatched: the GitLab pipeline starts it after its checks pass (main → canary, `X.Y.Z` tag → stable,
 # `X.Y.Z-beta.N` tag → beta), and a person can start a `test` build by hand, which publishes nothing.
 #
+# An `update-test` build publishes nothing either: on mac-arm64, windows-x64 and linux-x64 it packs the commit at two
+# versions with the update test's hook, installs the older one and checks that it updates itself to the newer one from
+# a local feed (the code's `dynwork/script/update-test.ts`). GitLab's main pipeline runs it before the canary, and the
+# canary of a commit that has the update test is published only once an update-test build of that commit passed.
+#
 # The workspace of every job is the fetched code, not this repository: `git init`, fetch `sha` from GitLab with the
 # deploy token of the `release` environment, check `HEAD == sha`. `./.github/actions/setup-bun` and `dynwork/script/*`
 # are the code's own. The token never goes in a URL or in `.git/config`: it is sent as a masked Basic header on the
@@ -19,9 +24,9 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: canary, beta or stable publish; test builds and publishes nothing
+        description: canary, beta or stable publish; test builds and update-test checks the update path, publishing nothing
         type: choice
-        options: [canary, beta, stable, test]
+        options: [canary, beta, stable, test, update-test]
         required: true
       ref:
         description: Branch or tag in GitLab the commit belongs to (the tag itself for beta and stable)
@@ -32,7 +37,7 @@ on:
         type: string
         required: true
       targets:
-        description: JSON list of mac-arm64, mac-x64, windows-x64, linux-x64, linux-arm64 (empty is all five)
+        description: JSON list of mac-arm64, mac-x64, windows-x64, linux-x64, linux-arm64 (empty is all five; update-test takes none)
         type: string
         default: ""
       version:
@@ -40,14 +45,14 @@ on:
         type: string
         default: ""
 
-# A newer canary replaces the running one, and a newer test build of a ref replaces that ref's; betas and stables run
-# alone and are never cancelled.
+# A newer canary replaces the running one, and a newer test or update-test build of a ref replaces that ref's; betas and
+# stables run alone and are never cancelled.
 concurrency:
   group: >-
     ${{ inputs.kind == 'canary' && 'build-canary' ||
-    inputs.kind == 'test' && format('build-test-{0}', inputs.ref) ||
+    (inputs.kind == 'test' || inputs.kind == 'update-test') && format('build-{0}-{1}', inputs.kind, inputs.ref) ||
     format('build-{0}-{1}', inputs.kind, github.run_id) }}
-  cancel-in-progress: ${{ inputs.kind == 'canary' || inputs.kind == 'test' }}
+  cancel-in-progress: ${{ inputs.kind == 'canary' || inputs.kind == 'test' || inputs.kind == 'update-test' }}
 
 permissions:
   contents: read
@@ -72,6 +77,7 @@ jobs:
       include: ${{ steps.inputs.outputs.include }}
       channel: ${{ steps.version.outputs.channel }}
       version: ${{ steps.version.outputs.version }}
+      gated: ${{ steps.gated.outputs.gated }}
     steps:
       - name: Check the inputs and pick the runners
         id: inputs
@@ -93,6 +99,11 @@ jobs:
           case "$KIND" in
             canary | test)
               [ -z "$VERSION" ] || fail "a $KIND build takes no version: it is decided from the run number"
+              ;;
+            update-test)
+              [ -z "$VERSION" ] || fail "an update-test build takes no version: the update test picks its two"
+              [ -z "$TARGETS" ] || fail "an update-test build takes no targets: it runs on mac-arm64, windows-x64 and linux-x64"
+              TARGETS='["mac-arm64","windows-x64","linux-x64"]'
               ;;
             beta)
               [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$ ]] || fail "a beta's version is X.Y.Z-beta.N, not \"$VERSION\""
@@ -160,6 +171,22 @@ jobs:
               ;;
           esac
 
+      # The canary of a commit that has the update test is published only after it passed (the gate job). Commits from
+      # before it have none and publish as they always have.
+      - name: Check whether the commit has the update test
+        id: gated
+        env:
+          KIND: ${{ inputs.kind }}
+        run: |
+          if [ -f dynwork/script/update-test.ts ]; then
+            echo "gated=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KIND" = update-test ]; then
+            echo "::error::this commit has no update test (dynwork/script/update-test.ts)"
+            exit 1
+          else
+            echo "gated=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Bun
         if: inputs.kind == 'canary' || inputs.kind == 'test'
         uses: ./.github/actions/setup-bun
@@ -191,6 +218,11 @@ jobs:
               channel=canary
               printf 'Canary %s\n\n%s\n' "$version" "$source" > "$notes"
               ;;
+            update-test)
+              # dynwork/script/update-test.ts packs its own two versions of the canary channel.
+              version=""
+              channel=canary
+              ;;
             beta)
               [ "${VERSION%-beta.*}" = "$identity" ] || fail "$VERSION is not a beta of $identity, the version in identity.ts"
               version=$VERSION
@@ -217,7 +249,7 @@ jobs:
           printf '%s %s, channel %s, from %s@%s\n' "$KIND" "$version" "$channel" "$REF" "$SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the notes for publishing
-        if: inputs.kind != 'test'
+        if: inputs.kind != 'test' && inputs.kind != 'update-test'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: notes
@@ -226,7 +258,7 @@ jobs:
           retention-days: 3
 
   package:
-    name: package ${{ matrix.target }}
+    name: ${{ inputs.kind == 'update-test' && 'update-test' || 'package' }} ${{ matrix.target }}
     needs: prepare
     strategy:
       fail-fast: false
@@ -239,6 +271,8 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=4096
       DYNWORK_CHANNEL: ${{ needs.prepare.outputs.channel }}
       DYNWORK_VERSION: ${{ needs.prepare.outputs.version }}
+      # What the packing steps run: the pack, or the update test, which packs twice and installs.
+      PACK: ${{ inputs.kind == 'update-test' && 'dynwork/script/update-test.ts' || 'dynwork/script/package.ts' }}
     steps:
       - *fetch
 
@@ -250,9 +284,24 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm
 
+      # The update test runs the AppImage and then the deb on a display of their own (Xvfb). The AppImage needs FUSE 2,
+      # and Electron's sandbox the user namespaces Ubuntu 24.04 keeps from apps AppArmor does not know. The deb's updater
+      # elevates with the first of gksudo, kdesudo, pkexec and beesu it finds, else sudo: none of those can ask anyone
+      # on this machine, so they are moved aside and the update installs through the runner's sudo, which needs no
+      # password. The admin prompt itself (pkexec) is not tested here.
+      - name: Set up the update test
+        if: inputs.kind == 'update-test' && runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb libfuse2t64 libgtk-3-0t64 libnss3 libxss1 libxtst6 \
+            libnotify4 libsecret-1-0 libasound2t64
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          for tool in gksudo kdesudo pkexec beesu; do
+            if found=$(command -v "$tool"); then sudo mv "$found" "$found.update-test"; fi
+          done
+
       - name: Package, unsigned
         if: runner.os == 'Linux' || (runner.os == 'Windows' && vars.WINDOWS_SIGNING != 'true')
-        run: bun dynwork/script/package.ts
+        run: bun "$PACK"
 
       # Squirrel.Mac only installs an update that satisfies the running app's designated requirement, which an ad hoc
       # signature ties to one build: until the Developer ID, every Mac build is signed with the same self-signed
@@ -267,7 +316,7 @@ jobs:
           # A commit from before the self-signed mode packs ad hoc, as it always has.
           if ! grep -q DYNWORK_MAC_KEYCHAIN dynwork/packages/build/src/signing.ts; then
             unset MAC_SELF_SIGNED_P12 MAC_SELF_SIGNED_PASSWORD
-            bun dynwork/script/package.ts
+            bun "$PACK"
             exit
           fi
           if [ -z "$MAC_SELF_SIGNED_P12" ] || [ -z "$MAC_SELF_SIGNED_PASSWORD" ]; then
@@ -295,7 +344,7 @@ jobs:
           security find-identity -p codesigning "$keychain" | grep 'DynWork Desktop (self-signed)' ||
             { echo "::error::the keychain holds no DynWork Desktop (self-signed) identity"; exit 1; }
           unset MAC_SELF_SIGNED_P12 MAC_SELF_SIGNED_PASSWORD
-          DYNWORK_MAC_KEYCHAIN="$keychain" bun dynwork/script/package.ts
+          DYNWORK_MAC_KEYCHAIN="$keychain" bun "$PACK"
 
       # electron-builder imports CSC_LINK into a keychain and notarizes whenever APPLE_API_* are set, so these secrets
       # exist only in this step. APPLE_API_KEY is the path of the .p8, written from its base64 secret.
@@ -313,7 +362,7 @@ jobs:
           trap 'rm -f "$key"' EXIT
           (umask 077 && printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$key")
           unset APPLE_API_KEY_P8
-          APPLE_API_KEY="$key" bun dynwork/script/package.ts
+          APPLE_API_KEY="$key" bun "$PACK"
 
       - name: Package, signed
         if: runner.os == 'Windows' && vars.WINDOWS_SIGNING == 'true'
@@ -326,10 +375,11 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: bun dynwork/script/package.ts
+        run: bun "$PACK"
 
       # dist/dynwork holds only the installers and the latest*.yml feeds package.ts checked.
       - name: Upload
+        if: inputs.kind != 'update-test'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dynwork-${{ inputs.kind }}-${{ matrix.target }}
@@ -337,11 +387,54 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # Every canary install updates itself to the next canary, and an update that breaks the update path cannot be undone
+  # by another update: the canary of a commit that has the update test is published only once an update-test build of
+  # that commit, dispatched from this repository's main, passed on all three of its machines. GitLab's main pipeline
+  # runs that build first (the code's dynwork/script/dispatch.ts). Betas and stables are not gated here.
+  gate:
+    name: check the commit's update test
+    needs: prepare
+    if: inputs.kind == 'canary' || inputs.kind == 'beta' || inputs.kind == 'stable'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KIND: ${{ inputs.kind }}
+      SHA: ${{ inputs.sha }}
+      GATED: ${{ needs.prepare.outputs.gated }}
+    steps:
+      - name: Find a passed update test of the commit
+        run: |
+          if [ "$KIND" != canary ]; then
+            echo "A $KIND is not gated by the update test"
+            exit 0
+          fi
+          if [ "$GATED" != true ]; then
+            echo "$SHA has no update test: its canary publishes ungated"
+            exit 0
+          fi
+          runs=$(gh api "repos/$GH_REPO/actions/workflows/build.yml/runs?event=workflow_dispatch&branch=main&status=success&per_page=100" |
+            jq -r --arg sha "$SHA" '.workflow_runs[] | select(.display_title | test("^update-test [^ ]+ " + $sha + "$")) | .id')
+          for run in $runs; do
+            passed=$(gh api "repos/$GH_REPO/actions/runs/$run/jobs?per_page=100" |
+              jq '[.jobs[] | select(.conclusion == "success") | .name] as $passed |
+                ["update-test mac-arm64", "update-test windows-x64", "update-test linux-x64"] - $passed == []')
+            if [ "$passed" = true ]; then
+              echo "The update test of $SHA passed: https://github.com/$GH_REPO/actions/runs/$run"
+              exit 0
+            fi
+          done
+          echo "::error::no update-test build of $SHA passed on mac-arm64, windows-x64 and linux-x64; dispatch one first"
+          exit 1
+
   publish:
     name: publish
-    # Only when every target built: a release missing a platform that was asked for is not published.
-    needs: [prepare, package]
-    if: inputs.kind != 'test'
+    # Only when every target built and the gate let it: a release missing a platform that was asked for is not published.
+    needs: [prepare, package, gate]
+    if: inputs.kind != 'test' && inputs.kind != 'update-test'
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 30
