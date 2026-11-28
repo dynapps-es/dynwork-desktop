@@ -92,6 +92,11 @@ gated. To run it for a merge request's head before merging:
 gh workflow run build.yml -R dynapps-es/dynwork-desktop -f kind=update-test -f ref=<branch> -f sha=<full commit sha>
 ```
 
+On `mac-arm64` the same job then runs `mac-arm64-foreign`: it installs the older pack again and serves, as the newer
+version, a minimal bundle that is not Electron, with the canary's app id and signed with the same certificate and
+designated requirement; Squirrel.Mac must install it in place and it must start. It is the premise of moving an install
+to another client (Rune) by update.
+
 Not covered: Windows Smart App Control on an unsigned update, and the deb/rpm admin prompt (pkexec), which a CI machine
 cannot answer; nor the rpm or the ARM64 and Intel Mac builds.
 
@@ -105,7 +110,12 @@ What a build checks before packing:
 - the commit fetched is `sha`, and for a beta or stable the GitLab tag `ref` still points at it;
 - a stable's version is the one in `dynwork/packages/branding/src/identity.ts` and `dynwork/releases/<version>.md`
   exists (its notes); a beta's is `<that version>-beta.N`;
-- a canary's version is `bun dynwork/script/canary.ts version <run number + CANARY_RUN_OFFSET>`.
+- a canary's version is `bun dynwork/script/canary.ts version <run number + CANARY_RUN_OFFSET>`;
+- a beta or stable with `dynwork/releases/<version>.rollout.json` is a staged rollout: `bun dynwork/script/rollout.ts`
+  checks the file is that version's (`{ "version", "orgs"?, "percent"? }`), and it is published as `rollout.json` in
+  the release, before the feeds (a beta's also in `dynwork-beta`; a release without one removes an earlier one from
+  `dynwork-beta`). Installs read it from their feed and decide on the device (the code's `dynwork/README.md`,
+  "Staged rollout").
 
 ## Settings this repository relies on
 
