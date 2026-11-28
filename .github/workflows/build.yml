@@ -188,7 +188,7 @@ jobs:
           fi
 
       - name: Set up Bun
-        if: inputs.kind == 'canary' || inputs.kind == 'test'
+        if: inputs.kind != 'update-test'
         uses: ./.github/actions/setup-bun
 
       - name: Pick the version, the channel and the notes
@@ -242,6 +242,15 @@ jobs:
               } > "$notes"
               ;;
           esac
+          # A staged rollout (the code's dynwork/packages/gui/src/rollout): a beta or stable with
+          # dynwork/releases/<version>.rollout.json publishes it as rollout.json, checked against its version first.
+          # Commits from before the rollout have neither the file nor the script.
+          rollout="dynwork/releases/$version.rollout.json"
+          if { [ "$KIND" = beta ] || [ "$KIND" = stable ]; } && [ -f "$rollout" ]; then
+            bun dynwork/script/rollout.ts "$rollout" "$version"
+            cp "$rollout" "$(dirname "$notes")/rollout.json"
+            printf 'staged rollout: %s\n' "$(jq -c . "$rollout")" >> "$GITHUB_STEP_SUMMARY"
+          fi
           {
             echo "version=$version"
             echo "channel=$channel"
@@ -253,7 +262,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: notes
-          path: ${{ runner.temp }}/notes/notes.md
+          # notes.md, and rollout.json when the release is staged.
+          path: ${{ runner.temp }}/notes
           if-no-files-found: error
           retention-days: 3
 
@@ -512,6 +522,9 @@ jobs:
             echo "::error::the artifacts hold no installer to publish"
             exit 1
           fi
+          # A staged release's rollout.json goes with the installers, before the feeds that offer its version.
+          staged=()
+          if [ -f rollout.json ]; then staged=(rollout.json); fi
           # The tags of this repository point at its own commits; the notes name the commit built.
           rolling() {
             if ! gh release view "$1" > /dev/null 2>&1; then
@@ -519,6 +532,13 @@ jobs:
             fi
             gh release edit "$1" --prerelease --latest=false --title "$2" --notes-file notes.md
             gh release upload "$1" "${installers[@]}" --clobber
+            # Only a beta stages dynwork-beta: beta installs receive a stable at once. A rollout an earlier release left
+            # there goes, so the feed never meets one that is not its own.
+            if [ "$KIND" = beta ] && [ "${#staged[@]}" -gt 0 ]; then
+              gh release upload "$1" "${staged[@]}" --clobber
+            elif gh release view "$1" --json assets --jq '.assets[].name' | grep -qx rollout.json; then
+              gh release delete-asset "$1" rollout.json --yes
+            fi
             if [ "${#feeds[@]}" -gt 0 ]; then gh release upload "$1" "${feeds[@]}" --clobber; fi
           }
           case "$KIND" in
@@ -526,12 +546,12 @@ jobs:
               rolling dynwork-canary "Dynwork Canary"
               ;;
             beta)
-              gh release create "$VERSION" "${installers[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
+              gh release create "$VERSION" "${installers[@]}" "${staged[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
                 --prerelease --latest=false --title "Dynwork $VERSION" --notes-file notes.md
               rolling dynwork-beta "Dynwork Beta"
               ;;
             stable)
-              gh release create "$VERSION" "${installers[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
+              gh release create "$VERSION" "${installers[@]}" "${staged[@]}" "${feeds[@]}" --target "$GITHUB_SHA" \
                 --latest --title "Dynwork $VERSION" --notes-file notes.md
               rolling dynwork-beta "Dynwork Beta"
               ;;
